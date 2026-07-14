@@ -17,6 +17,12 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<!-- Firebase (로그인 + 클라우드 동기화) -->
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+
 <style>
   :root{
     --ink:#1c1b1a;
@@ -311,6 +317,17 @@
   }
   .toast.show{opacity:1;}
 
+  #loginScreen{
+    max-width:360px;margin:80px auto 0;padding:0 20px;
+  }
+  #loginScreen .btn{width:100%;justify-content:center;margin-top:6px;}
+  .logout-btn{
+    background:none;border:1px solid var(--line);color:var(--muted);
+    border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;
+    font-family:'Work Sans',sans-serif;
+  }
+  .header-top{display:flex;justify-content:space-between;align-items:flex-start;}
+
   @media(max-width:720px){
     .field-row{grid-template-columns:1fr;}
     .schedule-row{grid-template-columns:1fr;}
@@ -326,12 +343,36 @@
 </head>
 <body>
 
-<header class="app-header">
-  <div class="brand">
-    <span class="keydot"><span></span><span></span></span>
-    <h1>피아노 학원 관리</h1>
+<div id="loginScreen">
+  <div class="card">
+    <h2 style="margin-bottom:14px;">피아노 학원 관리 로그인</h2>
+    <div class="field">
+      <label>이메일</label>
+      <input type="text" id="login-email" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>비밀번호</label>
+      <input type="password" id="login-password" autocomplete="current-password">
+    </div>
+    <div id="loginError" style="color:var(--danger);font-size:13px;margin-bottom:10px;"></div>
+    <button class="btn" id="loginBtn">로그인</button>
+    <div id="loginStatus" style="margin-top:10px;font-size:12px;color:var(--muted);"></div>
   </div>
-  <div class="sub">원생 등록 · 시간표 겹침 확인 · 출석부 · 회비 관리 · 결제 알림</div>
+</div>
+
+<div id="appRoot" style="display:none;">
+
+<header class="app-header">
+  <div class="header-top">
+    <div>
+      <div class="brand">
+        <span class="keydot"><span></span><span></span></span>
+        <h1>피아노 학원 관리</h1>
+      </div>
+      <div class="sub">원생 등록 · 시간표 겹침 확인 · 출석부 · 회비 관리 · 결제 알림</div>
+    </div>
+    <button class="logout-btn" id="logoutBtn">로그아웃</button>
+  </div>
 </header>
 
 <nav class="tabs">
@@ -452,6 +493,8 @@
 
 </main>
 
+</div><!-- /#appRoot -->
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -465,45 +508,58 @@ let data = { students: [], settings: { academyName:'', account:'' } };
 let currentEditId = null;
 let scheduleRowCount = 3;
 
-// ---------- storage ----------
-const BACKUP_KEY = 'backup:'+STORAGE_KEY;
+// ---------- Firebase 설정 ----------
+// 아래 값을 Firebase 콘솔 > 프로젝트 설정 > 일반 > 내 앱 에서 복사한
+// firebaseConfig 값으로 바꿔주세요.
+const firebaseConfig = {
+  apiKey: "AIzaSyDy4gJsfCNGWZyKzi0HPo7Mp5kr1MPaH9Q",
+  authDomain: "piano-academy-yini.firebaseapp.com",
+  projectId: "piano-academy-yini",
+  storageBucket: "piano-academy-yini.firebasestorage.app",
+  messagingSenderId: "705498423127",
+  appId: "1:705498423127:web:a99ad66345bb207ce2e812"
+};
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+let currentUid = null;
 
+// ---------- storage (Firestore, 계정별로 분리 저장) ----------
+function docRef(){
+  return db.collection('academies').doc(currentUid).collection('data').doc('main');
+}
+function backupKey(){ return 'backup:academy-data:'+(currentUid||'anon'); }
 function backupSet(payload){
-  try{ localStorage.setItem(BACKUP_KEY, payload); }catch(e){ /* 사용 불가 환경이면 조용히 무시 */ }
+  try{ localStorage.setItem(backupKey(), payload); }catch(e){ /* 사용 불가 환경이면 조용히 무시 */ }
 }
 function backupGet(){
-  try{ return localStorage.getItem(BACKUP_KEY); }catch(e){ return null; }
+  try{ return localStorage.getItem(backupKey()); }catch(e){ return null; }
 }
 
 async function loadData(){
-  let primaryRaw = null;
+  data = { students: [], settings: { academyName:'', account:'' } };
+  let loadedFromCloud = false;
   try{
-    const res = await window.storage.get(STORAGE_KEY, false);
-    if(res && res.value) primaryRaw = res.value;
-  }catch(e){
-    console.log('primary storage empty or unavailable', e);
-  }
-  const backupRaw = backupGet();
-
-  let chosenRaw = primaryRaw;
-  if(backupRaw && backupRaw !== primaryRaw){
-    try{
-      const a = primaryRaw ? JSON.parse(primaryRaw) : {students:[]};
-      const b = JSON.parse(backupRaw);
-      // 둘 중 학생 수가 더 많은 쪽을 선택해 데이터 유실을 방지
-      if((b.students||[]).length >= (a.students||[]).length){
-        chosenRaw = backupRaw;
-      }
-    }catch(e){ /* 파싱 실패 시 primary 유지 */ }
-  }
-
-  if(chosenRaw){
-    try{
-      const parsed = JSON.parse(chosenRaw);
+    const snap = await docRef().get();
+    if(snap.exists && snap.data().payload){
+      const parsed = JSON.parse(snap.data().payload);
       data = Object.assign({students:[],settings:{academyName:'',account:''}}, parsed);
       data.students.forEach(migrateStudent);
-    }catch(e){
-      console.error('저장된 데이터 파싱 실패', e);
+      loadedFromCloud = true;
+    }
+  }catch(e){
+    console.error('클라우드 불러오기 실패', e);
+  }
+  if(!loadedFromCloud){
+    // 오프라인 등으로 클라우드를 못 불러왔을 때만 이 기기의 백업으로 보완
+    const backupRaw = backupGet();
+    if(backupRaw){
+      try{
+        const parsed = JSON.parse(backupRaw);
+        data = Object.assign({students:[],settings:{academyName:'',account:''}}, parsed);
+        data.students.forEach(migrateStudent);
+        showToast('오프라인 상태라 이 기기에 저장된 최근 내용을 보여드리고 있어요.');
+      }catch(e){ /* 무시 */ }
     }
   }
   document.getElementById('s-academy').value = data.settings.academyName || '';
@@ -511,20 +567,56 @@ async function loadData(){
   renderAll();
 }
 
-// 이 브라우저의 백업이 실질적인 기본 저장소입니다. window.storage 동기화는
-// 되면 좋고 안 돼도 데이터에 지장 없는 '조용한' 보조 저장이라, 실패해도
-// 사용자에게 알리거나 재시도를 반복하지 않습니다.
 async function saveData(){
   const payload = JSON.stringify(data);
-  backupSet(payload); // 이 브라우저에는 항상 즉시 저장됨 — 이게 사실상의 저장 완료 시점
-
+  backupSet(payload); // 오프라인 대비, 이 기기에도 항상 즉시 백업
   try{
-    await window.storage.set(STORAGE_KEY, payload, false);
+    await docRef().set({payload, updatedAt: firebase.firestore.FieldValue.serverTimestamp()});
   }catch(e){
-    console.log('원격 동기화는 실패했지만 이 브라우저에는 저장되어 있습니다.', e);
+    console.error('클라우드 저장 실패', e);
+    showToast('클라우드 저장에 실패했습니다. 인터넷 연결을 확인해주세요. (이 기기에는 백업되어 있어요)');
   }
   return true;
 }
+
+// ---------- 로그인 ----------
+document.getElementById('loginBtn').addEventListener('click', doLogin);
+document.getElementById('login-password').addEventListener('keydown', (e)=>{ if(e.key==='Enter') doLogin(); });
+
+async function doLogin(){
+  const email = document.getElementById('login-email').value.trim();
+  const pw = document.getElementById('login-password').value;
+  const errEl = document.getElementById('loginError');
+  const statusEl = document.getElementById('loginStatus');
+  errEl.textContent = '';
+  if(!email || !pw){ errEl.textContent = '이메일과 비밀번호를 입력해주세요.'; return; }
+  statusEl.textContent = '로그인 중...';
+  try{
+    await auth.signInWithEmailAndPassword(email, pw);
+    statusEl.textContent = '';
+  }catch(e){
+    statusEl.textContent = '';
+    errEl.textContent = '로그인에 실패했습니다. 이메일/비밀번호를 확인해주세요.';
+  }
+}
+
+document.getElementById('logoutBtn').addEventListener('click', ()=>{
+  auth.signOut();
+});
+
+auth.onAuthStateChanged((user)=>{
+  if(user){
+    currentUid = user.uid;
+    document.getElementById('loginScreen').style.display = 'none';
+    document.getElementById('appRoot').style.display = '';
+    loadData();
+  }else{
+    currentUid = null;
+    document.getElementById('loginScreen').style.display = '';
+    document.getElementById('appRoot').style.display = 'none';
+    document.getElementById('login-password').value = '';
+  }
+});
 
 function showToast(msg){
   const t = document.getElementById('toast');
@@ -1150,7 +1242,7 @@ function renderAll(){
   updateAlertBadge();
 }
 
-loadData();
+// 데이터 로딩은 로그인 상태가 확인된 뒤 auth.onAuthStateChanged 에서 실행됩니다.
 </script>
 </body>
 </html>
